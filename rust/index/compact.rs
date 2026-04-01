@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::CompactStats;
+use crate::utils::types::{CompactStats, IndexMetadata, compute_balanced_boundaries};
 
 /// Per-centroid data built from a subset of chunks (used by incremental merge).
 pub struct PartialCompacted {
@@ -174,6 +174,481 @@ pub fn compact_index(
     Ok(CompactStats {
         total_embeddings: total_filtered,
         num_active_passages: active_pids_set.len(),
+    })
+}
+
+/// Compact all chunks into per-shard compacted files.
+///
+/// Same two-pass counting sort as `compact_index`, but writes separate
+/// `shard_N/{sizes,codes,residuals}.compacted.npy` files for each shard.
+/// If `num_shards` is 1, this produces the same result as `compact_index`
+/// (just written into a `shard_0/` subdirectory).
+///
+/// Shard boundaries are computed by `compute_balanced_boundaries` to
+/// balance the total embedding count across shards.
+pub fn compact_index_sharded(
+    index_path: &Path,
+    num_chunks: usize,
+    num_centroids: usize,
+    embedding_dim: usize,
+    nbits: usize,
+    device: Device,
+    deleted_pids: &HashSet<i64>,
+    num_shards: usize,
+) -> Result<(CompactStats, Vec<usize>)> {
+    assert!(num_shards > 0, "num_shards must be > 0");
+
+    // ── Pass 1: count embeddings per centroid (same as compact_index) ──
+    let mut centroid_counts = vec![0i64; num_centroids];
+    let mut total_filtered = 0i64;
+    let mut active_pids_set: HashSet<i64> = HashSet::new();
+
+    for chunk_idx in 0..num_chunks {
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let doclens_vec: Vec<i64> = doclens.try_into()?;
+
+        let pids_base: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
+
+        let codes_vec: Vec<i64> = codes.try_into()?;
+        let mut emb_offset = 0usize;
+        for (doc_idx, &doc_len) in doclens_vec.iter().enumerate() {
+            let pid = pids_base[doc_idx];
+            if deleted_pids.contains(&pid) {
+                emb_offset += doc_len as usize;
+                continue;
+            }
+            active_pids_set.insert(pid);
+            for _ in 0..doc_len as usize {
+                let centroid_id = codes_vec[emb_offset] as usize;
+                centroid_counts[centroid_id] += 1;
+                total_filtered += 1;
+                emb_offset += 1;
+            }
+        }
+    }
+
+    // Compute shard boundaries balanced by embedding count
+    let shard_boundaries = compute_balanced_boundaries(&centroid_counts, num_shards);
+
+    // ── Pass 2: place non-deleted embeddings into per-shard compacted arrays ──
+    let residual_dim = (embedding_dim * nbits) / 8;
+
+    // Compute per-shard sizes, offsets, and allocate tensors
+    struct ShardArrays {
+        sizes: Vec<i64>,
+        pids: Tensor,
+        residuals: Tensor,
+        write_offsets: Vec<i64>,
+    }
+
+    let mut shard_arrays: Vec<ShardArrays> = Vec::with_capacity(num_shards);
+    for s in 0..num_shards {
+        let c_start = shard_boundaries[s];
+        let c_end = shard_boundaries[s + 1];
+        let shard_sizes: Vec<i64> = centroid_counts[c_start..c_end].to_vec();
+        let shard_total: i64 = shard_sizes.iter().sum();
+
+        let mut write_offsets = vec![0i64; shard_sizes.len()];
+        {
+            let mut cumsum = 0i64;
+            for i in 0..shard_sizes.len() {
+                write_offsets[i] = cumsum;
+                cumsum += shard_sizes[i];
+            }
+        }
+
+        shard_arrays.push(ShardArrays {
+            sizes: shard_sizes,
+            pids: Tensor::zeros(&[shard_total], (Kind::Int64, device)),
+            residuals: Tensor::zeros(&[shard_total, residual_dim as i64], (Kind::Uint8, device)),
+            write_offsets,
+        });
+    }
+
+    // Precompute centroid -> shard mapping
+    let mut centroid_to_shard = vec![0usize; num_centroids];
+    for s in 0..num_shards {
+        for c in shard_boundaries[s]..shard_boundaries[s + 1] {
+            centroid_to_shard[c] = s;
+        }
+    }
+
+    for chunk_idx in 0..num_chunks {
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+            .to_device(device);
+        let residuals =
+            Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+                .to_device(device);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+        let pids_base = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+
+        let chunk_total = codes.size()[0];
+        let pids = Tensor::repeat_interleave_self_tensor(
+            &pids_base,
+            &doclens,
+            0,
+            Some(chunk_total),
+        );
+
+        let pids_vec: Vec<i64> = pids.to_device(Device::Cpu).try_into()?;
+        let keep_indices: Vec<i64> = (0..chunk_total)
+            .filter(|&i| !deleted_pids.contains(&pids_vec[i as usize]))
+            .collect();
+
+        if keep_indices.is_empty() {
+            continue;
+        }
+
+        let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
+        let filtered_codes = codes.index_select(0, &keep_tensor);
+        let filtered_residuals = residuals.index_select(0, &keep_tensor);
+        let filtered_pids = pids.index_select(0, &keep_tensor);
+
+        // Sort by centroid for counting-sort placement
+        let sort_result = filtered_codes.sort(0, false);
+        let sorted_codes = sort_result.0;
+        let sorted_idx = sort_result.1;
+        let sorted_residuals = filtered_residuals.index_select(0, &sorted_idx);
+        let sorted_pids = filtered_pids.index_select(0, &sorted_idx);
+
+        let chunk_counts = sorted_codes.bincount::<Tensor>(None, num_centroids as i64);
+        let chunk_counts_vec: Vec<i64> = chunk_counts.to_device(Device::Cpu).try_into()?;
+
+        let mut local_offset: i64 = 0;
+        for (centroid_id, &count) in chunk_counts_vec.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let s = centroid_to_shard[centroid_id];
+            let local_c = centroid_id - shard_boundaries[s];
+            let write_pos = shard_arrays[s].write_offsets[local_c];
+
+            shard_arrays[s]
+                .residuals
+                .narrow(0, write_pos, count)
+                .copy_(&sorted_residuals.narrow(0, local_offset, count));
+            shard_arrays[s]
+                .pids
+                .narrow(0, write_pos, count)
+                .copy_(&sorted_pids.narrow(0, local_offset, count));
+            shard_arrays[s].write_offsets[local_c] += count;
+            local_offset += count;
+        }
+    }
+
+    // Write per-shard files
+    for s in 0..num_shards {
+        let shard_dir = index_path.join(format!("shard_{}", s));
+        std::fs::create_dir_all(&shard_dir)?;
+
+        Tensor::from_slice(&shard_arrays[s].sizes)
+            .write_npy(shard_dir.join("sizes.compacted.npy"))?;
+        shard_arrays[s]
+            .pids
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("codes.compacted.npy"))?;
+        shard_arrays[s]
+            .residuals
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("residuals.compacted.npy"))?;
+    }
+
+    let stats = CompactStats {
+        total_embeddings: total_filtered,
+        num_active_passages: active_pids_set.len(),
+    };
+
+    Ok((stats, shard_boundaries))
+}
+
+/// Incrementally merge new data into per-shard compacted structures.
+///
+/// For each shard, loads its old compacted files, merges the relevant
+/// centroid-range slice of the `PartialCompacted`, and writes updated files.
+pub fn merge_compacted_incremental_sharded(
+    index_path: &Path,
+    partial: &PartialCompacted,
+    _num_centroids: usize,
+    residual_dim: usize,
+    device: Device,
+    shard_boundaries: &[usize],
+) -> Result<CompactStats> {
+    let num_shards = shard_boundaries.len() - 1;
+    let mut total_embeddings: i64 = 0;
+
+    for s in 0..num_shards {
+        let c_start = shard_boundaries[s];
+        let c_end = shard_boundaries[s + 1];
+        let shard_num_centroids = c_end - c_start;
+        let shard_dir = index_path.join(format!("shard_{}", s));
+        std::fs::create_dir_all(&shard_dir)?;
+
+        // Load existing shard data
+        let old_sizes_tensor = Tensor::read_npy(shard_dir.join("sizes.compacted.npy"))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let old_sizes: Vec<i64> = old_sizes_tensor.try_into()?;
+
+        let old_pids = Tensor::read_npy(shard_dir.join("codes.compacted.npy"))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+        let old_residuals = Tensor::read_npy(shard_dir.join("residuals.compacted.npy"))?
+            .to_device(device);
+
+        let mut old_offsets = vec![0i64; shard_num_centroids + 1];
+        for i in 0..shard_num_centroids {
+            old_offsets[i + 1] = old_offsets[i] + old_sizes[i];
+        }
+
+        // Compute new sizes for this shard's centroid range
+        let new_sizes: Vec<i64> = old_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &old)| old + partial.centroid_counts[c_start + i])
+            .collect();
+
+        let mut new_offsets = vec![0i64; shard_num_centroids + 1];
+        for i in 0..shard_num_centroids {
+            new_offsets[i + 1] = new_offsets[i] + new_sizes[i];
+        }
+        let new_total = new_offsets[shard_num_centroids];
+
+        let new_pids = Tensor::zeros(&[new_total], (Kind::Int64, device));
+        let new_residuals =
+            Tensor::zeros(&[new_total, residual_dim as i64], (Kind::Uint8, device));
+
+        let mut c = 0usize;
+        while c < shard_num_centroids {
+            let global_c = c_start + c;
+            if partial.centroid_counts[global_c] == 0 {
+                // Fast path: contiguous range of unchanged centroids
+                let range_start = c;
+                while c < shard_num_centroids && partial.centroid_counts[c_start + c] == 0 {
+                    c += 1;
+                }
+                let old_start = old_offsets[range_start];
+                let old_len = old_offsets[c] - old_start;
+                let dst_start = new_offsets[range_start];
+                if old_len > 0 {
+                    new_pids
+                        .narrow(0, dst_start, old_len)
+                        .copy_(&old_pids.narrow(0, old_start, old_len));
+                    new_residuals
+                        .narrow(0, dst_start, old_len)
+                        .copy_(&old_residuals.narrow(0, old_start, old_len));
+                }
+            } else {
+                let old_start = old_offsets[c];
+                let old_count = old_sizes[c];
+                let dst_start = new_offsets[c];
+
+                if old_count > 0 {
+                    new_pids
+                        .narrow(0, dst_start, old_count)
+                        .copy_(&old_pids.narrow(0, old_start, old_count));
+                    new_residuals
+                        .narrow(0, dst_start, old_count)
+                        .copy_(&old_residuals.narrow(0, old_start, old_count));
+                }
+
+                let new_count = partial.centroid_counts[global_c];
+                let append_start = dst_start + old_count;
+
+                let pids_tensor =
+                    Tensor::from_slice(&partial.centroid_pids[global_c]).to_device(device);
+                new_pids
+                    .narrow(0, append_start, new_count)
+                    .copy_(&pids_tensor);
+
+                let res_tensor = Tensor::from_slice(&partial.centroid_residuals[global_c])
+                    .to_device(device)
+                    .reshape([new_count, residual_dim as i64]);
+                new_residuals
+                    .narrow(0, append_start, new_count)
+                    .copy_(&res_tensor);
+
+                c += 1;
+            }
+        }
+
+        // Write updated shard files
+        Tensor::from_slice(&new_sizes).write_npy(shard_dir.join("sizes.compacted.npy"))?;
+        new_pids
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("codes.compacted.npy"))?;
+        new_residuals
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("residuals.compacted.npy"))?;
+
+        total_embeddings += new_total;
+    }
+
+    // Count unique PIDs across all shards
+    let mut all_pids_set: HashSet<i64> = HashSet::new();
+    for s in 0..num_shards {
+        let shard_dir = index_path.join(format!("shard_{}", s));
+        let pids = Tensor::read_npy(shard_dir.join("codes.compacted.npy"))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let pids_vec: Vec<i64> = pids.try_into()?;
+        all_pids_set.extend(pids_vec);
+    }
+
+    Ok(CompactStats {
+        total_embeddings,
+        num_active_passages: all_pids_set.len(),
+    })
+}
+
+/// Remove entries for specific PIDs from per-shard compacted structures,
+/// then merge new data in. Sharded version of `remove_and_merge_compacted`.
+pub fn remove_and_merge_compacted_sharded(
+    index_path: &Path,
+    partial: &PartialCompacted,
+    pids_to_remove: &HashSet<i64>,
+    _num_centroids: usize,
+    residual_dim: usize,
+    device: Device,
+    shard_boundaries: &[usize],
+) -> Result<CompactStats> {
+    let num_shards = shard_boundaries.len() - 1;
+    let mut total_embeddings: i64 = 0;
+    let mut all_pids_set: HashSet<i64> = HashSet::new();
+
+    for s in 0..num_shards {
+        let c_start = shard_boundaries[s];
+        let c_end = shard_boundaries[s + 1];
+        let shard_num_centroids = c_end - c_start;
+        let shard_dir = index_path.join(format!("shard_{}", s));
+
+        let old_sizes_tensor = Tensor::read_npy(shard_dir.join("sizes.compacted.npy"))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let old_sizes: Vec<i64> = old_sizes_tensor.try_into()?;
+
+        let old_pids = Tensor::read_npy(shard_dir.join("codes.compacted.npy"))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+        let old_residuals = Tensor::read_npy(shard_dir.join("residuals.compacted.npy"))?
+            .to_device(device);
+
+        let mut old_offsets = vec![0i64; shard_num_centroids + 1];
+        for i in 0..shard_num_centroids {
+            old_offsets[i + 1] = old_offsets[i] + old_sizes[i];
+        }
+
+        // Build keep indices and filtered sizes
+        let old_pids_vec: Vec<i64> = old_pids.to_device(Device::Cpu).try_into()?;
+        let mut keep_indices: Vec<i64> = Vec::with_capacity(old_pids_vec.len());
+        let mut filtered_sizes = vec![0i64; shard_num_centroids];
+        for c in 0..shard_num_centroids {
+            let start = old_offsets[c] as usize;
+            let end = old_offsets[c + 1] as usize;
+            for (local_i, &pid) in old_pids_vec[start..end].iter().enumerate() {
+                if !pids_to_remove.contains(&pid) {
+                    keep_indices.push((start + local_i) as i64);
+                    filtered_sizes[c] += 1;
+                }
+            }
+        }
+
+        let kept_pids;
+        let kept_residuals;
+        if !keep_indices.is_empty() {
+            let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
+            kept_pids = old_pids.index_select(0, &keep_tensor);
+            kept_residuals = old_residuals.index_select(0, &keep_tensor);
+        } else {
+            kept_pids = Tensor::zeros(&[0], (Kind::Int64, device));
+            kept_residuals = Tensor::zeros(&[0, residual_dim as i64], (Kind::Uint8, device));
+        }
+        drop(old_pids);
+        drop(old_residuals);
+
+        let new_sizes: Vec<i64> = filtered_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| f + partial.centroid_counts[c_start + i])
+            .collect();
+
+        let mut new_offsets = vec![0i64; shard_num_centroids + 1];
+        for i in 0..shard_num_centroids {
+            new_offsets[i + 1] = new_offsets[i] + new_sizes[i];
+        }
+        let new_total = new_offsets[shard_num_centroids];
+
+        let new_pids = Tensor::zeros(&[new_total], (Kind::Int64, device));
+        let new_residuals =
+            Tensor::zeros(&[new_total, residual_dim as i64], (Kind::Uint8, device));
+
+        let mut filtered_offsets = vec![0i64; shard_num_centroids + 1];
+        for i in 0..shard_num_centroids {
+            filtered_offsets[i + 1] = filtered_offsets[i] + filtered_sizes[i];
+        }
+
+        for c in 0..shard_num_centroids {
+            let global_c = c_start + c;
+            let dst_start = new_offsets[c];
+
+            let filt_count = filtered_sizes[c];
+            if filt_count > 0 {
+                let src_start = filtered_offsets[c];
+                new_pids
+                    .narrow(0, dst_start, filt_count)
+                    .copy_(&kept_pids.narrow(0, src_start, filt_count));
+                new_residuals
+                    .narrow(0, dst_start, filt_count)
+                    .copy_(&kept_residuals.narrow(0, src_start, filt_count));
+            }
+
+            let new_count = partial.centroid_counts[global_c];
+            if new_count > 0 {
+                let append_start = dst_start + filt_count;
+
+                let pids_tensor =
+                    Tensor::from_slice(&partial.centroid_pids[global_c]).to_device(device);
+                new_pids
+                    .narrow(0, append_start, new_count)
+                    .copy_(&pids_tensor);
+
+                let res_tensor = Tensor::from_slice(&partial.centroid_residuals[global_c])
+                    .to_device(device)
+                    .reshape([new_count, residual_dim as i64]);
+                new_residuals
+                    .narrow(0, append_start, new_count)
+                    .copy_(&res_tensor);
+            }
+        }
+
+        // Write updated shard files
+        Tensor::from_slice(&new_sizes).write_npy(shard_dir.join("sizes.compacted.npy"))?;
+        new_pids
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("codes.compacted.npy"))?;
+        new_residuals
+            .to_device(Device::Cpu)
+            .write_npy(shard_dir.join("residuals.compacted.npy"))?;
+
+        let final_pids_vec: Vec<i64> = new_pids.to_device(Device::Cpu).try_into()?;
+        all_pids_set.extend(final_pids_vec);
+        total_embeddings += new_total;
+    }
+
+    Ok(CompactStats {
+        total_embeddings,
+        num_active_passages: all_pids_set.len(),
     })
 }
 
@@ -693,4 +1168,86 @@ fn unpack_residuals(packed: &Tensor, nbits: u8, dim: i64) -> Tensor {
     let powers: Vec<i64> = (0..nbits).map(|i| 1i64 << i).collect();
     let powers_tensor = Tensor::from_slice(&powers).to_device(device);
     (&bits_grouped * &powers_tensor).sum_dim_intlist(-1, false, Kind::Int64)
+}
+
+/// Re-shard an existing monolithic (single-shard) index into `num_shards` shards.
+///
+/// Reads the root-level `sizes/codes/residuals.compacted.npy`, computes balanced
+/// boundaries, slices data into per-shard files in `shard_N/` subdirectories,
+/// and updates `metadata.json`. O(total_embeddings) copy, no re-encoding.
+pub fn shard_existing_index(
+    index_path: &Path,
+    num_shards: usize,
+    device: Device,
+) -> Result<()> {
+    anyhow::ensure!(num_shards > 0, "num_shards must be > 0");
+
+    let mut meta = IndexMetadata::load(index_path)?;
+    if meta.num_shards.is_some() && meta.num_shards.unwrap() > 1 {
+        anyhow::bail!(
+            "Index is already sharded ({} shards). Re-sharding an already-sharded index is not supported; compact first.",
+            meta.num_shards.unwrap()
+        );
+    }
+
+    let sizes_tensor = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64);
+    let sizes_vec: Vec<i64> = sizes_tensor.try_into()?;
+    let num_centroids = sizes_vec.len();
+
+    let boundaries = compute_balanced_boundaries(&sizes_vec, num_shards);
+
+    // Load monolithic compacted data
+    let pids = Tensor::read_npy(index_path.join("codes.compacted.npy"))?
+        .to_device(device)
+        .to_kind(Kind::Int64);
+    let residuals = Tensor::read_npy(index_path.join("residuals.compacted.npy"))?
+        .to_device(device);
+
+    // Compute offsets
+    let mut offsets = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        offsets[i + 1] = offsets[i] + sizes_vec[i];
+    }
+
+    // Slice into per-shard files
+    for s in 0..num_shards {
+        let c_start = boundaries[s];
+        let c_end = boundaries[s + 1];
+        let shard_dir = index_path.join(format!("shard_{}", s));
+        std::fs::create_dir_all(&shard_dir)?;
+
+        let shard_sizes: Vec<i64> = sizes_vec[c_start..c_end].to_vec();
+        let emb_start = offsets[c_start];
+        let emb_end = offsets[c_end];
+        let shard_total = emb_end - emb_start;
+
+        Tensor::from_slice(&shard_sizes)
+            .write_npy(shard_dir.join("sizes.compacted.npy"))?;
+
+        if shard_total > 0 {
+            pids.narrow(0, emb_start, shard_total)
+                .to_device(Device::Cpu)
+                .write_npy(shard_dir.join("codes.compacted.npy"))?;
+            residuals
+                .narrow(0, emb_start, shard_total)
+                .to_device(Device::Cpu)
+                .write_npy(shard_dir.join("residuals.compacted.npy"))?;
+        } else {
+            // Write empty files
+            let residual_dim = if residuals.dim() > 1 { residuals.size()[1] } else { 1 };
+            Tensor::zeros(&[0], (Kind::Int64, Device::Cpu))
+                .write_npy(shard_dir.join("codes.compacted.npy"))?;
+            Tensor::zeros(&[0, residual_dim], (Kind::Uint8, Device::Cpu))
+                .write_npy(shard_dir.join("residuals.compacted.npy"))?;
+        }
+    }
+
+    // Update metadata
+    meta.num_shards = Some(num_shards);
+    meta.shard_boundaries = Some(boundaries);
+    meta.save(index_path)?;
+
+    Ok(())
 }

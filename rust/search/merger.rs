@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tch::{no_grad, Device, Kind, Tensor};
 
-use crate::utils::types::{PassageId, Score};
+use crate::utils::types::{DecompressedCentroidsOutput, PassageId, Score, ShardCellOutput};
 
 /// Configuration for the merger
 #[derive(Debug, Clone)]
@@ -531,4 +531,61 @@ impl Combiner for ReduceSumMseCombiner {
     fn rhs(&self, rhs: f32) -> f32 {
         self.lhs_mse + rhs
     }
+}
+
+/// Reassemble per-shard decompression results into a single
+/// `DecompressedCentroidsOutput` ordered by global cell index.
+///
+/// Each shard returns its decompressed cells tagged with their position in the
+/// global cell list (0..num_tokens*nprobe). This function places them back into
+/// the cell-ordered structure that the existing merge pipeline expects.
+pub fn gather_shard_cells(
+    shard_outputs: Vec<ShardCellOutput>,
+    num_cells: usize,
+    device: Device,
+) -> Result<DecompressedCentroidsOutput> {
+    // Pre-allocate per-cell containers
+    let mut cell_pids: Vec<Vec<PassageId>> = vec![Vec::new(); num_cells];
+    let mut cell_scores: Vec<Vec<Score>> = vec![Vec::new(); num_cells];
+    let mut cell_capacities = vec![0i64; num_cells];
+    let mut cell_sizes = vec![0i32; num_cells];
+
+    for shard_out in &shard_outputs {
+        let mut pid_offset = 0usize;
+        for (local_idx, &global_cell) in shard_out.global_cell_indices.iter().enumerate() {
+            let cap = shard_out.capacities[local_idx];
+            let sz = shard_out.sizes[local_idx] as usize;
+
+            cell_capacities[global_cell] = cap;
+            cell_sizes[global_cell] = shard_out.sizes[local_idx];
+
+            cell_pids[global_cell] = shard_out.passage_ids[pid_offset..pid_offset + sz].to_vec();
+            cell_scores[global_cell] = shard_out.scores[pid_offset..pid_offset + sz].to_vec();
+            pid_offset += sz;
+        }
+    }
+
+    // Flatten into contiguous arrays
+    let total_entries: usize = cell_sizes.iter().map(|&s| s as usize).sum();
+    let mut all_pids = Vec::with_capacity(total_entries);
+    let mut all_scores = Vec::with_capacity(total_entries);
+    let mut offsets = Vec::with_capacity(num_cells + 1);
+    offsets.push(0i64);
+
+    for cell in 0..num_cells {
+        all_pids.extend_from_slice(&cell_pids[cell]);
+        all_scores.extend_from_slice(&cell_scores[cell]);
+        offsets.push(offsets.last().unwrap() + cell_sizes[cell] as i64);
+    }
+
+    // Scores must stay float32 — the merger's CUDA path does cumsum/subtraction
+    // that loses precision in float16. The single-shard path also keeps scores
+    // as float32 throughout the merge.
+    Ok(DecompressedCentroidsOutput {
+        capacities: Tensor::from_slice(&cell_capacities).to_device(device),
+        sizes: Tensor::from_slice(&cell_sizes).to_device(device).to_kind(Kind::Int),
+        passage_ids: Tensor::from_slice(&all_pids).to_device(device).to_kind(Kind::Int64),
+        scores: Tensor::from_slice(&all_scores).to_device(device).to_kind(Kind::Float),
+        offsets: Tensor::from_slice(&offsets).to_device(device).to_kind(Kind::Int64),
+    })
 }

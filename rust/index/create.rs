@@ -16,11 +16,15 @@ use crate::index::encode::{encode_chunks, compress_into_codes, EncodeResult, CHU
 
 /// Creates a new WARP index from a collection of document embeddings.
 /// Result containing the index metadata on success
+///
+/// When `num_shards` is `Some(n)` with n > 1, the compacted index is split
+/// across `n` shard subdirectories, balanced by embedding count.
 pub fn create_index(
     config: &IndexConfig,
     embeddings_source: &mut dyn EmbeddingSource,
     centroids: Tensor,
     seed: Option<u64>,
+    num_shards: Option<usize>,
 ) -> Result<()> {
     // Create the index directory if it doesn't exist
     std::fs::create_dir_all(&config.index_path)?;
@@ -64,7 +68,7 @@ pub fn create_index(
         0,    // start chunk index
     )?;
 
-    finalize_and_compact(config, &index_plan, &encode_result, &centroids)?;
+    finalize_and_compact(config, &index_plan, &encode_result, &centroids, num_shards)?;
 
     Ok(())
 }
@@ -209,11 +213,40 @@ fn finalize_and_compact(
     plan: &IndexPlan,
     encode_result: &EncodeResult,
     centroids: &Tensor,
+    num_shards: Option<usize>,
 ) -> Result<()> {
     let final_avg_doclen = if plan.n_docs > 0 {
         encode_result.total_embeddings as f64 / plan.n_docs as f64
     } else {
         0.0
+    };
+
+    let num_centroids = centroids.size()[0] as usize;
+    let effective_shards = num_shards.filter(|&n| n > 1);
+
+    let (shard_count, shard_boundaries) = if let Some(n) = effective_shards {
+        let (_, boundaries) = compact::compact_index_sharded(
+            &config.index_path,
+            plan.num_chunks,
+            num_centroids,
+            config.embedding_dim as usize,
+            plan.nbits as usize,
+            config.device,
+            &std::collections::HashSet::new(),
+            n,
+        )?;
+        (Some(n), Some(boundaries))
+    } else {
+        compact::compact_index(
+            &config.index_path,
+            plan.num_chunks,
+            num_centroids,
+            config.embedding_dim as usize,
+            plan.nbits as usize,
+            config.device,
+            &std::collections::HashSet::new(),
+        )?;
+        (None, None)
     };
 
     let meta = IndexMetadata {
@@ -224,21 +257,13 @@ fn finalize_and_compact(
         avg_doclen: final_avg_doclen,
         num_passages: plan.n_docs,
         next_passage_id: plan.n_docs as i64,
-        num_centroids: centroids.size()[0] as usize,
+        num_centroids,
         dim: config.embedding_dim as usize,
         created_at: Utc::now().to_rfc3339(),
+        num_shards: shard_count,
+        shard_boundaries,
     };
     meta.save(&config.index_path)?;
-
-    compact::compact_index(
-        &config.index_path,
-        plan.num_chunks,
-        centroids.size()[0] as usize,
-        config.embedding_dim as usize,
-        plan.nbits as usize,
-        config.device,
-        &std::collections::HashSet::new(),
-    )?;
 
     Ok(())
 }

@@ -4,8 +4,10 @@ use std::path::Path;
 use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::index::compact::{
-    build_partial_compacted, compact_index, merge_compacted_incremental,
-    prune_empty_centroids, recalibrate_threshold, remove_and_merge_compacted,
+    build_partial_compacted, compact_index, compact_index_sharded,
+    merge_compacted_incremental, merge_compacted_incremental_sharded,
+    prune_empty_centroids, recalibrate_threshold,
+    remove_and_merge_compacted, remove_and_merge_compacted_sharded,
 };
 use crate::index::delete::{clear_tombstones, load_tombstones, save_tombstones};
 use crate::index::encode::{
@@ -91,13 +93,24 @@ pub fn add_to_index(
         Some(&new_pids_set),
     )?;
 
-    let stats = merge_compacted_incremental(
-        index_path,
-        &partial,
-        meta.num_centroids,
-        residual_dim,
-        device,
-    )?;
+    let stats = if let Some(ref boundaries) = meta.shard_boundaries {
+        merge_compacted_incremental_sharded(
+            index_path,
+            &partial,
+            meta.num_centroids,
+            residual_dim,
+            device,
+            boundaries,
+        )?
+    } else {
+        merge_compacted_incremental(
+            index_path,
+            &partial,
+            meta.num_centroids,
+            residual_dim,
+            device,
+        )?
+    };
 
     save_metadata_from_stats(index_path, &meta, &stats, total_chunks, next_pid + num_new_docs as i64)?;
 
@@ -186,15 +199,26 @@ pub fn update_in_index(
     )?;
 
     // Remove old entries for updated PIDs from compacted, then merge new ones in.
-    // We do this by rebuilding: remove old PIDs + merge new data.
-    let stats = remove_and_merge_compacted(
-        index_path,
-        &partial,
-        &updated_pids_set,
-        meta.num_centroids,
-        residual_dim,
-        device,
-    )?;
+    let stats = if let Some(ref boundaries) = meta.shard_boundaries {
+        remove_and_merge_compacted_sharded(
+            index_path,
+            &partial,
+            &updated_pids_set,
+            meta.num_centroids,
+            residual_dim,
+            device,
+            boundaries,
+        )?
+    } else {
+        remove_and_merge_compacted(
+            index_path,
+            &partial,
+            &updated_pids_set,
+            meta.num_centroids,
+            residual_dim,
+            device,
+        )?
+    };
 
     // next_passage_id stays the same: we're replacing, not appending
     save_metadata_from_stats(index_path, &meta, &stats, total_chunks, meta.next_passage_id)?;
@@ -229,15 +253,30 @@ pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
         };
 
     // Step 3: Rebuild compacted structures from clean chunks (single pass)
-    let stats = compact_index(
-        index_path,
-        num_chunks,
-        num_centroids,
-        meta.dim,
-        meta.nbits as usize,
-        device,
-        &HashSet::new(), // chunks are already clean
-    )?;
+    let (stats, new_boundaries) = if let Some(n) = meta.num_shards.filter(|&n| n > 1) {
+        let (s, b) = compact_index_sharded(
+            index_path,
+            num_chunks,
+            num_centroids,
+            meta.dim,
+            meta.nbits as usize,
+            device,
+            &HashSet::new(),
+            n,
+        )?;
+        (s, Some(b))
+    } else {
+        let s = compact_index(
+            index_path,
+            num_chunks,
+            num_centroids,
+            meta.dim,
+            meta.nbits as usize,
+            device,
+            &HashSet::new(),
+        )?;
+        (s, None)
+    };
 
     // Step 4: Recalibrate cluster threshold from current data
     recalibrate_threshold(index_path, num_chunks, meta.nbits, meta.dim, device)?;
@@ -258,6 +297,8 @@ pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
         num_partitions: meta.num_partitions,
         dim: meta.dim,
         created_at: meta.created_at,
+        num_shards: meta.num_shards,
+        shard_boundaries: new_boundaries.or(meta.shard_boundaries),
     };
     updated.save(index_path)?;
 
@@ -273,6 +314,8 @@ pub fn append_centroids(index_path: &Path, new_centroids: &Tensor) -> Result<()>
         return Ok(());
     }
 
+    let mut meta = IndexMetadata::load(index_path)?;
+
     // Append to centroids.npy
     let old_centroids = Tensor::read_npy(index_path.join("centroids.npy"))?
         .to_device(Device::Cpu);
@@ -282,23 +325,36 @@ pub fn append_centroids(index_path: &Path, new_centroids: &Tensor) -> Result<()>
     );
     combined.write_npy(index_path.join("centroids.npy"))?;
 
-    // Extend sizes.compacted with zeros
-    let old_sizes = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
-        .to_device(Device::Cpu);
-    let ext = Tensor::zeros(&[k_new], (old_sizes.kind(), Device::Cpu));
-    Tensor::cat(&[old_sizes, ext], 0)
-        .write_npy(index_path.join("sizes.compacted.npy"))?;
+    if meta.shard_boundaries.is_some() {
+        // Sharded: extend the last shard's sizes with zeros
+        let boundaries = meta.shard_boundaries.as_mut().unwrap();
+        let last_shard = boundaries.len() - 2;
+        let last_shard_dir = index_path.join(format!("shard_{}", last_shard));
+        if last_shard_dir.is_dir() {
+            let old_shard_sizes = Tensor::read_npy(last_shard_dir.join("sizes.compacted.npy"))?
+                .to_device(Device::Cpu);
+            let ext = Tensor::zeros(&[k_new], (old_shard_sizes.kind(), Device::Cpu));
+            Tensor::cat(&[old_shard_sizes, ext], 0)
+                .write_npy(last_shard_dir.join("sizes.compacted.npy"))?;
+        }
+        // Extend last boundary
+        *boundaries.last_mut().unwrap() += k_new as usize;
+    } else {
+        // Non-sharded: extend monolithic sizes and offsets
+        let old_sizes = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
+            .to_device(Device::Cpu);
+        let ext = Tensor::zeros(&[k_new], (old_sizes.kind(), Device::Cpu));
+        Tensor::cat(&[old_sizes, ext], 0)
+            .write_npy(index_path.join("sizes.compacted.npy"))?;
 
-    // Extend offsets.compacted: new entries equal to old total
-    let old_offsets = Tensor::read_npy(index_path.join("offsets.compacted.npy"))?
-        .to_device(Device::Cpu);
-    let total = old_offsets.i(-1).int64_value(&[]);
-    let ext_offsets = Tensor::full(&[k_new], total, (old_offsets.kind(), Device::Cpu));
-    Tensor::cat(&[old_offsets, ext_offsets], 0)
-        .write_npy(index_path.join("offsets.compacted.npy"))?;
+        let old_offsets = Tensor::read_npy(index_path.join("offsets.compacted.npy"))?
+            .to_device(Device::Cpu);
+        let total = old_offsets.i(-1).int64_value(&[]);
+        let ext_offsets = Tensor::full(&[k_new], total, (old_offsets.kind(), Device::Cpu));
+        Tensor::cat(&[old_offsets, ext_offsets], 0)
+            .write_npy(index_path.join("offsets.compacted.npy"))?;
+    }
 
-    // Update metadata
-    let mut meta = IndexMetadata::load(index_path)?;
     meta.num_centroids += k_new as usize;
     meta.save(index_path)?;
 
@@ -397,6 +453,8 @@ fn save_metadata_from_stats(
         num_centroids: meta.num_centroids,
         dim: meta.dim,
         created_at: meta.created_at.clone(),
+        num_shards: meta.num_shards.clone(),
+        shard_boundaries: meta.shard_boundaries.clone(),
     };
     updated.save(index_path)
 }

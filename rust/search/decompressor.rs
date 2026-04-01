@@ -66,6 +66,12 @@ impl CentroidDecompressor {
         reversed
     }
 
+    /// Decompress centroids and compute fine scores.
+    ///
+    /// `cell_token_indices`: optional per-cell token index mapping. When
+    /// `Some`, `cell_token_indices[i]` gives the query-token that cell `i`
+    /// belongs to. When `None`, the classic `cell_idx / nprobe` layout is
+    /// assumed (single-shard path).
     pub fn decompress_centroids(
         &self,
         centroid_ids: &Tensor,
@@ -73,24 +79,32 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        cell_token_indices: Option<&[usize]>,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
 
-        let num_total_centroids = index.offsets_compacted.size()[0] - 1;
-        let max_centroid_id = centroid_ids.max().int64_value(&[]);
+        // Translate global centroid IDs to local when running on a shard
+        let lookup_ids = if let Some(sc) = &index.shard_config {
+            &centroid_ids - (sc.centroid_start as i64)
+        } else {
+            centroid_ids.shallow_clone()
+        };
 
-        if max_centroid_id >= num_total_centroids {
+        let num_total_centroids = index.offsets_compacted.size()[0] - 1;
+        let max_lookup_id = lookup_ids.max().int64_value(&[]);
+
+        if max_lookup_id >= num_total_centroids {
             return Err(anyhow!(
-                "Centroid ID {} is out of bounds (max valid ID is {})",
-                max_centroid_id,
+                "Centroid lookup ID {} is out of bounds (max valid ID is {})",
+                max_lookup_id,
                 num_total_centroids - 1
             ));
         }
 
         // Gather begin/end offsets and capacities for every requested centroid
-        let begins = index.offsets_compacted.index_select(0, &centroid_ids);
-        let ends = index.offsets_compacted.index_select(0, &(centroid_ids + 1));
+        let begins = index.offsets_compacted.index_select(0, &lookup_ids);
+        let ends = index.offsets_compacted.index_select(0, &(&lookup_ids + 1));
         let capacities = &ends - &begins;
 
         // Early exit when there is nothing to process
@@ -129,6 +143,7 @@ impl CentroidDecompressor {
                 index,
                 &query_embeddings,
                 nprobe,
+                cell_token_indices,
             );
         }
 
@@ -163,6 +178,17 @@ impl CentroidDecompressor {
         let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
         let begins_vec: Vec<i64> = begins.try_into()?;
 
+        // Build per-cell token indices: explicit when provided, else classic layout
+        let default_tokens: Vec<usize>;
+        let token_for_cell: &[usize] = if let Some(indices) = cell_token_indices {
+            indices
+        } else {
+            default_tokens = (0..num_cells)
+                .map(|i| (i / nprobe).min(num_tokens - 1))
+                .collect();
+            &default_tokens
+        };
+
         let use_parallel = self.thread_pool.current_num_threads() > 1 && num_cells > 1;
 
         if use_parallel {
@@ -175,8 +201,7 @@ impl CentroidDecompressor {
                             &capacities_vec,
                             &begins_vec,
                             &centroid_scores_vec,
-                            nprobe,
-                            num_tokens,
+                            token_for_cell,
                             bucket_score_stride,
                             &bucket_scores_flat,
                             index,
@@ -209,8 +234,7 @@ impl CentroidDecompressor {
                     &capacities_vec,
                     &begins_vec,
                     &centroid_scores_vec,
-                    nprobe,
-                    num_tokens,
+                    token_for_cell,
                     bucket_score_stride,
                     &bucket_scores_flat,
                     index,
@@ -256,6 +280,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        cell_token_indices: Option<&[usize]>,
     ) -> Result<DecompressedCentroidsOutput> {
         let device = query_embeddings.device();
         anyhow::ensure!(
@@ -372,7 +397,15 @@ impl CentroidDecompressor {
             Tensor::stack(&[hi, lo], -1).view([total_capacity, dim])
         };
 
-        let token_indices = candidate_cells.divide_scalar_mode(nprobe as i64, "trunc");
+        let token_indices = if let Some(cti) = cell_token_indices {
+            // Sharded path: expand per-cell token indices to per-candidate
+            let cell_tokens = Tensor::from_slice(
+                &cti.iter().map(|&x| x as i64).collect::<Vec<_>>(),
+            ).to_device(device);
+            cell_tokens.repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity))
+        } else {
+            candidate_cells.divide_scalar_mode(nprobe as i64, "trunc")
+        };
 
         let bucket_weights = index.bucket_weights.to_kind(Kind::Float);
         let query = query_embeddings.to_kind(Kind::Float);
@@ -406,8 +439,7 @@ impl CentroidDecompressor {
         capacities_vec: &[i64],
         begins_vec: &[i64],
         centroid_scores_vec: &[f32],
-        nprobe: usize,
-        num_tokens: usize,
+        token_for_cell: &[usize],
         bucket_score_stride: usize,
         bucket_scores_flat: &[f32],
         index: &Arc<ReadOnlyIndex>,
@@ -437,7 +469,7 @@ impl CentroidDecompressor {
             .unwrap_or_default();
 
         let centroid_score = centroid_scores_vec[cell_idx];
-        let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
+        let token_idx = token_for_cell[cell_idx];
         let bucket_scores_offset = token_idx * bucket_score_stride;
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];

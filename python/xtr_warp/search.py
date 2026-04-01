@@ -392,6 +392,7 @@ class XTRWarp:
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
+        num_shards: int | None = None,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -401,10 +402,6 @@ class XTRWarp:
             A list of document embeddings or the path to a folder where the embeddings
             are stored. The stored embeddings must be in `.npy` format,
             in a 2D tensor `[total_len, dim]` with a matching `.doclens.npy` sidecar.
-        stream:
-            Whether to stream embeddings from disk during index creation. If True,
-            `embeddings_source` must be a str and embeddings will be read from disk
-            during encoding.
         device:
             The device to use for the indexing (eg. cpu, cuda, mps, etc.)
         kmeans_niters:
@@ -421,6 +418,11 @@ class XTRWarp:
         use_triton_kmeans:
             Whether to use the Triton-based K-means implementation. If None, it will be
             set to True if the device is not "cpu".
+        num_shards:
+            Number of shards to split the compacted index into. When set,
+            the index is partitioned by centroid range into ``num_shards``
+            subdirectories for multi-GPU search. ``None`` (default) creates
+            a single-shard index.
 
         """
         self.device = device
@@ -465,6 +467,7 @@ class XTRWarp:
             embeddings=documents_embeddings or str(embeddings_path),
             embedding_dim=dim,
             seed=seed,
+            num_shards=num_shards,
         )
 
         return self
@@ -495,6 +498,34 @@ class XTRWarp:
                 os.makedirs(index_path)
             except OSError as e:
                 raise e
+
+    def shard(self, num_shards: int, device: str | None = None) -> "XTRWarp":
+        """Re-shard an existing single-shard index into multiple shards.
+
+        Reads the monolithic compacted arrays, computes balanced boundaries,
+        and writes per-shard files. O(total_embeddings) copy, no re-encoding.
+
+        Args:
+        ----
+        num_shards:
+            Number of shards to create.
+        device:
+            Compute device for the slicing operation. Defaults to the
+            device set at init or load time.
+
+        """
+        device = self._resolve_device(device)
+        torch_path = self._ensure_torch_initialized(device)
+        if self._loaded_searchers is not None:
+            self.free()
+        xtr_warp_rs.shard(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+            num_shards=num_shards,
+        )
+        self._metadata = None
+        return self
 
     def delete(
         self,
@@ -881,12 +912,44 @@ class XTRWarp:
             mmap = False
 
         self._mmap = mmap
-        self._loaded_searchers = []
-        for d in self.devices:
-            _ = self._ensure_torch_initialized(d)
-            searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str, mmap)
+        self._is_sharded = False
+
+        meta = self._load_metadata()
+        num_shards = meta.get("num_shards") if meta else None
+
+        if num_shards is not None and num_shards > 1:
+            # Sharded index: need exactly num_shards devices
+            if len(self.devices) == 1:
+                # Replicate the single device for all shards (all on same GPU / CPU)
+                self.devices = [self.devices[0]] * num_shards
+
+            if len(self.devices) != num_shards:
+                raise ValueError(
+                    f"Sharded index has {num_shards} shards but "
+                    f"{len(self.devices)} devices were provided. "
+                    f"Pass exactly {num_shards} devices or a single device."
+                )
+
+            for d in self.devices:
+                _ = self._ensure_torch_initialized(d)
+
+            searcher = xtr_warp_rs.ShardedSearcherPy(
+                index_path=self.index,
+                devices=self.devices,
+                dtype=dtype_str,
+                use_mmap=mmap,
+            )
             searcher.load()
-            self._loaded_searchers.append(searcher)
+            self._loaded_searchers = [searcher]
+            self._is_sharded = True
+        else:
+            # Single-shard (legacy) path
+            self._loaded_searchers = []
+            for d in self.devices:
+                _ = self._ensure_torch_initialized(d)
+                searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str, mmap)
+                searcher.load()
+                self._loaded_searchers.append(searcher)
 
         return self
 
@@ -1077,7 +1140,15 @@ class XTRWarp:
             max_candidates=max_candidates,
         )
         torch_path = self._ensure_torch_initialized(device)
-        if len(self.devices) == 1:
+        if self._is_sharded:
+            # Sharded path: single ShardedSearcherPy handles all shards
+            scores = search_on_device(
+                torch_path=torch_path,
+                queries_embeddings=queries_embeddings,
+                search_config=search_config,
+                loaded_index=self._loaded_searchers[0],
+            )
+        elif len(self.devices) == 1:
             scores = search_on_device(
                 torch_path=torch_path,
                 queries_embeddings=queries_embeddings,

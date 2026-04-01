@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex};
+use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex, ReadOnlyIndex, ShardConfig, ShardedIndex};
 
 /// Parse a NPY file header, returning (data_offset, shape, tch_kind).
 fn parse_npy_header(path: &Path) -> Result<(u64, Vec<i64>, Kind)> {
@@ -222,6 +222,7 @@ impl IndexLoader {
             kdummy_centroid,
             metadata,
             _mmap_handles: Arc::new(mmap_handles),
+            shard_config: None,
         })
     }
 
@@ -280,4 +281,125 @@ impl IndexLoader {
         Ok(kdummy_idx as CentroidId)
     }
 
+    /// Load a sharded index across multiple devices.
+    ///
+    /// Centroids and bucket_weights are replicated on each device.
+    /// Each shard loads only its slice of the compacted arrays from `shard_i/`.
+    pub fn load_sharded(
+        index_path: impl AsRef<Path>,
+        devices: &[tch::Device],
+        dtype: Kind,
+        use_mmap: bool,
+    ) -> Result<ShardedIndex> {
+        let index_path = index_path.as_ref();
+        let metadata = IndexMetadata::load(index_path)?;
+
+        let num_shards = metadata.num_shards
+            .ok_or_else(|| anyhow!("Index at {:?} is not sharded (num_shards absent)", index_path))?;
+        let shard_boundaries = metadata.shard_boundaries.as_ref()
+            .ok_or_else(|| anyhow!("Index at {:?} missing shard_boundaries", index_path))?;
+
+        anyhow::ensure!(
+            shard_boundaries.len() == num_shards + 1,
+            "shard_boundaries length {} != num_shards + 1 ({})",
+            shard_boundaries.len(),
+            num_shards + 1
+        );
+        anyhow::ensure!(
+            devices.len() == num_shards,
+            "Expected {} devices for {} shards, got {}",
+            num_shards,
+            num_shards,
+            devices.len()
+        );
+
+        // Load shared tensors once (on CPU), then replicate per shard
+        let centroids_cpu = Tensor::read_npy(index_path.join("centroids.npy"))?
+            .to_dtype(dtype, false, false);
+        let bucket_weights_cpu = Tensor::read_npy(index_path.join("bucket_weights.npy"))?
+            .to_dtype(dtype, false, false);
+
+        let mut shards = Vec::with_capacity(num_shards);
+        let mut shard_configs = Vec::with_capacity(num_shards);
+
+        for s in 0..num_shards {
+            let device = devices[s];
+            let c_start = shard_boundaries[s];
+            let c_end = shard_boundaries[s + 1];
+
+            let shard_dir = index_path.join(format!("shard_{}", s));
+            anyhow::ensure!(
+                shard_dir.is_dir(),
+                "Shard directory {:?} does not exist",
+                shard_dir
+            );
+
+            let shard_config = ShardConfig {
+                shard_id: s,
+                num_shards,
+                centroid_start: c_start,
+                centroid_end: c_end,
+            };
+
+            // Load shard compacted files
+            let sizes_compacted = Tensor::read_npy(shard_dir.join("sizes.compacted.npy"))?
+                .to_device(device);
+
+            let codes_path = shard_dir.join("codes.compacted.npy");
+            let residuals_path = if shard_dir.join("residuals.repacked.compacted.npy").exists() {
+                shard_dir.join("residuals.repacked.compacted.npy")
+            } else {
+                shard_dir.join("residuals.compacted.npy")
+            };
+
+            let (pids_compacted, residuals_compacted, mmap_handles) = if use_mmap {
+                anyhow::ensure!(
+                    device == tch::Device::Cpu,
+                    "mmap is only supported on CPU"
+                );
+                let loader = IndexLoader::new(index_path, device, dtype, use_mmap)?;
+                let (codes, mmap1) = loader.load_tensor_mmap(&codes_path)?;
+                let (residuals, mmap2) = loader.load_tensor_mmap(&residuals_path)?;
+                (codes, residuals, vec![mmap1, mmap2])
+            } else {
+                let codes = Tensor::read_npy(&codes_path)?.to_device(device);
+                let residuals = Tensor::read_npy(&residuals_path)?.to_device(device);
+                (codes, residuals, vec![])
+            };
+
+            // Compute local offsets from local sizes
+            let shard_num_centroids = sizes_compacted.size()[0];
+            let offsets_compacted = {
+                let offsets = Tensor::zeros(&[shard_num_centroids + 1], (Kind::Int64, device));
+                let cumsum = sizes_compacted.cumsum(0, Kind::Int64);
+                offsets.narrow(0, 1, shard_num_centroids).copy_(&cumsum);
+                offsets
+            };
+
+            // Find kdummy within this shard's sizes
+            let kdummy_centroid = sizes_compacted.argmin(0, false).int64_value(&[]) as CentroidId;
+
+            let loaded = LoadedIndex {
+                centroids: centroids_cpu.to_device(device),
+                bucket_weights: bucket_weights_cpu.to_device(device),
+                sizes_compacted,
+                pids_compacted,
+                residuals_compacted,
+                offsets_compacted,
+                kdummy_centroid,
+                metadata: metadata.clone(),
+                _mmap_handles: Arc::new(mmap_handles),
+                shard_config: Some(shard_config.clone()),
+            };
+
+            shards.push(Arc::new(ReadOnlyIndex(loaded)));
+            shard_configs.push(shard_config);
+        }
+
+        Ok(ShardedIndex {
+            shards,
+            shard_configs,
+            metadata,
+        })
+    }
 }

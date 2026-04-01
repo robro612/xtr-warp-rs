@@ -24,8 +24,8 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
-use search::{IndexLoader, Searcher};
-use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
+use search::{IndexLoader, Searcher, ShardedSearcherImpl};
+use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult, ShardedIndex};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -241,6 +241,140 @@ impl LoadedSearcher {
     }
 }
 
+/// Represents a sharded index loaded across multiple devices.
+#[pyclass(unsendable)]
+struct ShardedSearcherPy {
+    sharded_index: Option<ShardedIndex>,
+    index_path: String,
+    devices: Vec<String>,
+    dtype: Kind,
+    use_mmap: bool,
+    deleted_pids: HashSet<i64>,
+}
+
+#[pymethods]
+impl ShardedSearcherPy {
+    #[new]
+    #[pyo3(signature = (index_path, devices, dtype, use_mmap=false))]
+    fn new(
+        index_path: String,
+        devices: Vec<String>,
+        dtype: String,
+        use_mmap: bool,
+    ) -> PyResult<Self> {
+        let dtype = get_dtype(&dtype)?;
+        Ok(Self {
+            sharded_index: None,
+            index_path,
+            devices,
+            dtype,
+            use_mmap,
+            deleted_pids: HashSet::new(),
+        })
+    }
+
+    /// Load the sharded index across the specified devices.
+    fn load(&mut self) -> PyResult<()> {
+        let devices: Vec<Device> = self
+            .devices
+            .iter()
+            .map(|d| get_device(d))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let sharded = IndexLoader::load_sharded(
+            &self.index_path,
+            &devices,
+            self.dtype,
+            self.use_mmap,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load sharded index: {}", e)))?;
+
+        // Load tombstones if present
+        self.deleted_pids =
+            crate::index::delete::load_tombstones(Path::new(&self.index_path))
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e))
+                })?;
+
+        self.sharded_index = Some(sharded);
+        Ok(())
+    }
+
+    /// Search the sharded index.
+    fn search(
+        &self,
+        torch_path: String,
+        queries_embeddings: PyTensor,
+        search_config: SearchConfig,
+    ) -> PyResult<Vec<SearchResult>> {
+        call_torch(torch_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+        let shape = queries_embeddings.size();
+        if shape.len() != 3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "Expected 3D tensor, got {}D tensor with shape {:?}",
+                shape.len(),
+                shape
+            )));
+        }
+
+        let sharded_index = self
+            .sharded_index
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Index not loaded; call load() first"))?;
+
+        // Create a fresh scorer per search call so the caller's SearchConfig
+        // (with auto-tuned hyperparams) is used — matching LoadedSearcher behavior.
+        let searcher = ShardedSearcherImpl::new_ref(sharded_index, &search_config)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create sharded searcher: {}", e)))?;
+
+        let k = search_config.k;
+
+        let mut results = searcher
+            .search(Query {
+                embeddings: queries_embeddings.deref().shallow_clone(),
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Sharded search failed: {}", e)))?;
+
+        // Filter tombstoned PIDs and truncate to k
+        for result in &mut results {
+            if !self.deleted_pids.is_empty() {
+                let mut filtered_pids = Vec::with_capacity(k);
+                let mut filtered_scores = Vec::with_capacity(k);
+                for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
+                    if !self.deleted_pids.contains(pid) {
+                        filtered_pids.push(*pid);
+                        filtered_scores.push(*score);
+                        if filtered_pids.len() == k {
+                            break;
+                        }
+                    }
+                }
+                result.passage_ids = filtered_pids;
+                result.scores = filtered_scores;
+            } else {
+                result.passage_ids.truncate(k);
+                result.scores.truncate(k);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Update in-memory tombstones without full reload after delete().
+    fn update_tombstones(&mut self, passage_ids: Vec<i64>) -> PyResult<()> {
+        self.deleted_pids.extend(passage_ids);
+        Ok(())
+    }
+
+    /// Free the loaded index.
+    fn free(&mut self) {
+        self.sharded_index = None;
+        self.deleted_pids.clear();
+    }
+}
+
 /// Pre-loads the native Torch library from a specified path.
 ///
 /// Call this function once at the start of a Python script if you encounter
@@ -311,6 +445,7 @@ impl EmbeddingsInput {
     embeddings,
     embedding_dim=None,
     seed=None,
+    num_shards=None,
 ))]
 fn create(
     _py: Python<'_>,
@@ -322,6 +457,7 @@ fn create(
     embeddings: EmbeddingsInput,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
+    num_shards: Option<usize>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -346,6 +482,7 @@ fn create(
         source.as_mut(),
         centroids,
         seed,
+        num_shards,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
@@ -445,6 +582,25 @@ fn compact(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to compact index: {}", e)))
 }
 
+/// Shard an existing single-shard index into multiple shards.
+/// Reads the monolithic compacted arrays, computes balanced boundaries,
+/// slices into per-shard files, and updates metadata.
+#[pyfunction]
+#[pyo3(signature = (index, torch_path, device, num_shards))]
+fn shard(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+    num_shards: usize,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+    let device = get_device(&device)?;
+    crate::index::compact::shard_existing_index(Path::new(&index), num_shards, device)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to shard index: {}", e)))
+}
+
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
 ///
@@ -457,6 +613,7 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchConfig>()?;
     m.add_class::<SearchResult>()?;
     m.add_class::<LoadedSearcher>()?;
+    m.add_class::<ShardedSearcherPy>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
@@ -465,5 +622,6 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(compact, m)?)?;
     m.add_function(wrap_pyfunction!(append_centroids_py, m)?)?;
+    m.add_function(wrap_pyfunction!(shard, m)?)?;
     Ok(())
 }

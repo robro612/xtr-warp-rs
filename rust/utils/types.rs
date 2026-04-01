@@ -178,6 +178,29 @@ pub struct SearchResult {
     pub query_id: usize,
 }
 
+/// Configuration for a single shard within a sharded index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardConfig {
+    /// This shard's index (0..num_shards-1)
+    pub shard_id: usize,
+    /// Total number of shards
+    pub num_shards: usize,
+    /// First centroid ID owned by this shard (inclusive)
+    pub centroid_start: usize,
+    /// Last centroid ID owned by this shard (exclusive)
+    pub centroid_end: usize,
+}
+
+/// A sharded index: multiple ReadOnlyIndex instances (one per shard), each
+/// holding replicated centroids/bucket_weights but only its slice of the
+/// compacted arrays.
+#[derive(Clone)]
+pub struct ShardedIndex {
+    pub shards: Vec<Arc<ReadOnlyIndex>>,
+    pub shard_configs: Vec<ShardConfig>,
+    pub metadata: IndexMetadata,
+}
+
 /// Represents the plan outlined to create an index
 pub struct IndexPlan {
     pub n_docs: usize,
@@ -201,6 +224,13 @@ pub struct IndexMetadata {
     pub num_centroids: usize,
     pub dim: usize,
     pub created_at: String,
+    /// Number of shards (absent or 1 for legacy single-shard indices).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_shards: Option<usize>,
+    /// Centroid boundaries per shard: [0, b1, b2, ..., num_centroids].
+    /// Length is num_shards + 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_boundaries: Option<Vec<usize>>,
 }
 
 impl IndexMetadata {
@@ -256,6 +286,10 @@ pub struct LoadedIndex {
     /// Mmap handles that must outlive the tensors they back.
     /// Arc-wrapped for shared ownership across shallow clones.
     pub _mmap_handles: Arc<Vec<Mmap>>,
+
+    /// Shard configuration, if this index is one shard of a sharded index.
+    /// Used by the decompressor to translate global centroid IDs to local offsets.
+    pub shard_config: Option<ShardConfig>,
 }
 
 impl Clone for LoadedIndex {
@@ -270,6 +304,7 @@ impl Clone for LoadedIndex {
             kdummy_centroid: self.kdummy_centroid,
             metadata: self.metadata.clone(),
             _mmap_handles: Arc::clone(&self._mmap_handles),
+            shard_config: self.shard_config.clone(),
         }
     }
 }
@@ -390,6 +425,63 @@ pub struct AddResult {
     pub residual_norms: Vec<f32>,
     /// Embedding dimension.
     pub embedding_dim: usize,
+}
+
+/// Per-shard decompression output, tagged with global cell indices so the
+/// coordinator can reassemble them into a single DecompressedCentroidsOutput.
+pub struct ShardCellOutput {
+    /// Positions of this shard's cells in the global cell list (0..num_tokens*nprobe).
+    pub global_cell_indices: Vec<usize>,
+    /// Per-cell passage IDs (concatenated).
+    pub passage_ids: Vec<PassageId>,
+    /// Per-cell scores (concatenated, same length as passage_ids).
+    pub scores: Vec<Score>,
+    /// Per-cell capacities (total range, before dedup).
+    pub capacities: Vec<i64>,
+    /// Per-cell sizes (after dedup).
+    pub sizes: Vec<i32>,
+}
+
+/// Compute shard boundaries that balance the total number of embeddings across
+/// shards. Returns a Vec of length `num_shards + 1` where `boundaries[i]` is
+/// the first centroid ID of shard `i` and `boundaries[num_shards] == num_centroids`.
+pub fn compute_balanced_boundaries(sizes: &[i64], num_shards: usize) -> Vec<usize> {
+    assert!(num_shards > 0, "num_shards must be > 0");
+    let num_centroids = sizes.len();
+    if num_shards >= num_centroids {
+        // More shards than centroids: one centroid per shard (some empty).
+        let mut boundaries: Vec<usize> = (0..=num_centroids).collect();
+        // Pad with empty shards at the end.
+        while boundaries.len() < num_shards + 1 {
+            boundaries.push(num_centroids);
+        }
+        return boundaries;
+    }
+
+    let total: i64 = sizes.iter().sum();
+    let target_per_shard = total as f64 / num_shards as f64;
+
+    let mut boundaries = Vec::with_capacity(num_shards + 1);
+    boundaries.push(0);
+
+    let mut running: i64 = 0;
+    for (i, &s) in sizes.iter().enumerate() {
+        running += s;
+        // Place a boundary when we've accumulated enough, but don't exceed num_shards.
+        if running as f64 >= target_per_shard && boundaries.len() < num_shards {
+            boundaries.push(i + 1);
+            running = 0;
+        }
+    }
+    boundaries.push(num_centroids);
+
+    // In degenerate cases we may not have placed enough boundaries; fill in.
+    while boundaries.len() < num_shards + 1 {
+        let last = *boundaries.last().unwrap();
+        boundaries.push(last);
+    }
+
+    boundaries
 }
 
 /// Parses a string identifier into a `tch::Device`.
