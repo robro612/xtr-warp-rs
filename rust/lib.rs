@@ -446,6 +446,7 @@ impl EmbeddingsInput {
     embedding_dim=None,
     seed=None,
     num_shards=None,
+    codec_sample_cap=None,
 ))]
 fn create(
     _py: Python<'_>,
@@ -458,6 +459,7 @@ fn create(
     embedding_dim: Option<u32>,
     seed: Option<u64>,
     num_shards: Option<usize>,
+    codec_sample_cap: Option<usize>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -483,6 +485,7 @@ fn create(
         centroids,
         seed,
         num_shards,
+        codec_sample_cap,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }

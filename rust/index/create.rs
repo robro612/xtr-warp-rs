@@ -4,6 +4,7 @@ use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use serde_json::json;
+use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -25,12 +26,13 @@ pub fn create_index(
     centroids: Tensor,
     seed: Option<u64>,
     num_shards: Option<usize>,
+    codec_sample_cap: Option<usize>,
 ) -> Result<()> {
     // Create the index directory if it doesn't exist
     std::fs::create_dir_all(&config.index_path)?;
 
     let (index_plan, sample_pids, sampled_embeddings) =
-        plan_and_sample(config, embeddings_source, seed)?;
+        plan_and_sample(config, embeddings_source, seed, codec_sample_cap)?;
 
     let plan_fpath = config.index_path.join("plan.json");
     let plan_data = json!({ "nbits": index_plan.nbits, "num_chunks": index_plan.num_chunks });
@@ -66,6 +68,7 @@ pub fn create_index(
         config.embedding_dim,
         None, // auto-assign passage IDs 0..N
         0,    // start chunk index
+        num_shards,
     )?;
 
     finalize_and_compact(config, &index_plan, &encode_result, &centroids, num_shards)?;
@@ -77,6 +80,7 @@ fn plan_and_sample(
     config: &IndexConfig,
     source: &mut dyn EmbeddingSource,
     seed: Option<u64>,
+    codec_sample_cap: Option<usize>,
 ) -> Result<(IndexPlan, Vec<i64>, Tensor)> {
     let n_docs = source.num_docs();
     if n_docs == 0 {
@@ -99,7 +103,14 @@ fn plan_and_sample(
             total += doc.size()[0];
         }
         let (pids, embeddings) =
-            sample_embeddings_in_memory(source, n_docs, config.embedding_dim, &mut *rng, config.device)?;
+            sample_embeddings_in_memory(
+                source,
+                n_docs,
+                config.embedding_dim,
+                &mut *rng,
+                config.device,
+                codec_sample_cap,
+            )?;
         (total, pids, embeddings)
     } else {
         let (pids, embeddings, total) = sample_embeddings_streaming(
@@ -108,6 +119,7 @@ fn plan_and_sample(
             config.embedding_dim,
             &mut *rng,
             config.device,
+            codec_sample_cap,
         )?;
         (total, pids, embeddings)
     };
@@ -134,9 +146,9 @@ fn sample_embeddings_in_memory(
     embedding_dim: u32,
     rng: &mut dyn RngCore,
     device: Device,
+    codec_sample_cap: Option<usize>,
 ) -> Result<(Vec<i64>, Tensor)> {
-    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
-    let k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
+    let k = codec_sample_k(n_docs, codec_sample_cap);
     if k == 0 {
         let empty = Tensor::zeros(&[0, embedding_dim as i64], (Kind::Half, device));
         return Ok((Vec::new(), empty));
@@ -166,9 +178,9 @@ fn sample_embeddings_streaming(
     embedding_dim: u32,
     rng: &mut dyn RngCore,
     device: Device,
+    codec_sample_cap: Option<usize>,
 ) -> Result<(Vec<i64>, Tensor, i64)> {
-    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
-    let k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
+    let k = codec_sample_k(n_docs, codec_sample_cap);
 
     let mut sample_tensors: Vec<Tensor> = Vec::with_capacity(k);
     let mut sample_pids: Vec<i64> = Vec::with_capacity(k);
@@ -206,6 +218,22 @@ fn sample_embeddings_streaming(
         .to_kind(Kind::Half)
         .to_device(device);
     Ok((sample_pids, sampled_embeddings, total_doc_len))
+}
+
+fn codec_sample_k(n_docs: usize, codec_sample_cap: Option<usize>) -> usize {
+    if n_docs == 0 {
+        return 0;
+    }
+    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
+    let heuristic_k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
+
+    let env_cap = env::var("XTR_WARP_CODEC_SAMPLE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    let cap = codec_sample_cap.or(env_cap);
+
+    cap.map_or(heuristic_k, |c| heuristic_k.min(c))
 }
 
 fn finalize_and_compact(

@@ -69,6 +69,7 @@ pub fn add_to_index(
         meta.dim as u32,
         Some(&new_passage_ids),
         start_chunk_idx,
+        meta.num_shards,
     )?;
 
     // If coalescing, prepend old data to the first new chunk
@@ -169,6 +170,7 @@ pub fn update_in_index(
         meta.dim as u32,
         Some(passage_ids),
         meta.num_chunks,
+        meta.num_shards,
     )?;
 
     // Remove updated PIDs from tombstones — fresh data lives in the new chunks.

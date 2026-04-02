@@ -7,7 +7,7 @@ import shutil
 import numpy as np
 import pytest
 import torch
-from xtr_warp.search import XTRWarp, _load_torch_path
+from xtr_warp.search import XTRWarp, _load_torch_path, compute_kmeans
 
 from xtr_warp import xtr_warp_rs
 
@@ -28,6 +28,16 @@ CREATE_KWARGS = dict(
 )
 
 SEARCH_KWARGS = dict(top_k=10, num_threads=1)
+RUN_GPU_MEMORY_TESTS = os.getenv("XTR_WARP_RUN_GPU_MEMORY_TESTS", "0") == "1"
+
+# Explicit hyperparams for parity tests (auto-tune fills these when omitted).
+HIGH_LEVEL_FIXED_SEARCH_KWARGS = dict(
+    top_k=10,
+    num_threads=1,
+    nprobe=4,
+    bound=128,
+    max_candidates=256,
+)
 
 
 def _fresh_index(index_name=INDEX_DIR, num_docs=NUM_DOCS):
@@ -64,6 +74,78 @@ def _result_lists(results):
 
 def _cleanup(index_name=INDEX_DIR):
     shutil.rmtree(index_name, ignore_errors=True)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_opt_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _device_index(device: str) -> int:
+    if device == "cuda":
+        return 0
+    if device.startswith("cuda:"):
+        return int(device.split(":", 1)[1])
+    raise ValueError(f"Expected CUDA device string, got {device}")
+
+
+def _usable_cuda_devices(max_devices: int | None = None) -> list[str]:
+    if not torch.cuda.is_available():
+        return []
+    try:
+        count = torch.cuda.device_count()
+    except Exception:
+        return []
+
+    usable: list[str] = []
+    for i in range(count):
+        dev = f"cuda:{i}"
+        try:
+            torch.empty(1, device=dev)
+            torch.cuda.synchronize(i)
+            usable.append(dev)
+        except Exception:
+            continue
+
+    if max_devices is not None:
+        usable = usable[:max_devices]
+    return usable
+
+
+def _reset_cuda_peak(device: str) -> None:
+    dev_idx = _device_index(device)
+    torch.cuda.set_device(dev_idx)
+    torch.empty(1, device=f"cuda:{dev_idx}")  # ensure allocator/context initialized
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(dev_idx)
+
+
+def _cuda_peak_mb(device: str) -> float:
+    dev_idx = _device_index(device)
+    torch.cuda.synchronize(dev_idx)
+    return float(torch.cuda.max_memory_allocated(dev_idx) / (1024 * 1024))
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -438,13 +520,29 @@ def test_high_level_create_sharded():
     shutil.rmtree(index_name, ignore_errors=True)
 
 
-def test_high_level_shard_then_search():
+@pytest.mark.parametrize(
+    ("hyperparams_mode", "search_kwargs"),
+    [
+        (
+            "auto",
+            SEARCH_KWARGS,
+        ),
+        (
+            "fixed",
+            HIGH_LEVEL_FIXED_SEARCH_KWARGS,
+        ),
+    ],
+    ids=["auto_hyperparams", "fixed_hyperparams"],
+)
+def test_high_level_shard_then_search(hyperparams_mode, search_kwargs):
     """Create monolithic, shard() it, then load + search via the high-level API.
 
-    Both paths use the same high-level search kwargs so optimize_hyperparams()
-    applies identically before and after sharding.
+    Runs twice: with only *top_k* / *num_threads* (auto-tuned hyperparams), and
+    with explicit nprobe/bound/max_candidates so both behaviors stay aligned
+    pre- vs post-shard.
     """
-    index_name = ".indices/test_shard_highlevel2"
+    # Separate directory per parametrization so parallel runs do not clash.
+    index_name = f".indices/test_shard_highlevel2_{hyperparams_mode}"
     if os.path.exists(index_name):
         shutil.rmtree(index_name)
 
@@ -457,7 +555,7 @@ def test_high_level_shard_then_search():
 
     # Search unsharded
     idx.load("cpu")
-    results_before = idx.search(queries_embeddings=queries, **SEARCH_KWARGS)
+    results_before = idx.search(queries_embeddings=queries, **search_kwargs)
     idx.free()
 
     # Shard via high-level API
@@ -465,7 +563,7 @@ def test_high_level_shard_then_search():
 
     # Load + search again (should auto-detect sharded)
     idx.load("cpu")
-    results_after = idx.search(queries_embeddings=queries, **SEARCH_KWARGS)
+    results_after = idx.search(queries_embeddings=queries, **search_kwargs)
     idx.free()
 
     assert len(results_after) == 5
@@ -479,7 +577,8 @@ def test_high_level_shard_then_search():
         total = len(pids_before | pids_after)
         jaccard = overlap / total if total else 1.0
         assert jaccard >= 0.5, (
-            f"Query {q}: high-level sharded search too different. Jaccard={jaccard:.2f}"
+            f"[{hyperparams_mode}] Query {q}: high-level sharded search too different. "
+            f"Jaccard={jaccard:.2f}"
         )
 
     shutil.rmtree(index_name, ignore_errors=True)
@@ -566,3 +665,310 @@ def test_sharded_search_multi_gpu():
         )
 
     shutil.rmtree(index_name, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    not RUN_GPU_MEMORY_TESTS,
+    reason="Set XTR_WARP_RUN_GPU_MEMORY_TESTS=1 to enable GPU profiling tests",
+)
+def test_profile_build_memory_trend_sharded_create():
+    """Profile build-time GPU peak memory for sharded create.
+
+    This is an opt-in profiling test (not a strict correctness test).
+    It checks that increasing shard count does not increase peak memory.
+    """
+    usable = _usable_cuda_devices(max_devices=1)
+    if len(usable) < 1:
+        pytest.skip("No usable CUDA devices in this allocation")
+    device = usable[0]
+    num_docs = _env_int("XTR_WARP_PROFILE_NUM_DOCS", 600)
+    doc_len = _env_int("XTR_WARP_PROFILE_DOC_LEN", 256)
+    use_triton_kmeans = _env_bool("XTR_WARP_PROFILE_USE_TRITON_KMEANS", False)
+    n_samples_kmeans = _env_opt_int("XTR_WARP_PROFILE_N_SAMPLES_KMEANS")
+
+    torch.manual_seed(SEED)
+    docs = [torch.randn(doc_len, DIM, device="cpu") for _ in range(num_docs)]
+    print(
+        "[mem-profile][build] config "
+        f"num_docs={num_docs}, doc_len={doc_len}, dim={DIM}, "
+        f"use_triton_kmeans={use_triton_kmeans}, n_samples_kmeans={n_samples_kmeans}"
+    )
+
+    def _build_peak(num_shards: int) -> float:
+        index_name = f".indices/test_shard_mem_build_{num_shards}"
+        _cleanup(index_name)
+        idx = XTRWarp(index=index_name)
+        try:
+            _reset_cuda_peak(device)
+            idx.create(
+                embeddings_source=docs,
+                kmeans_niters=4,
+                max_points_per_centroid=256,
+                nbits=4,
+                seed=SEED,
+                device=device,
+                num_shards=num_shards,
+                use_triton_kmeans=use_triton_kmeans,
+                n_samples_kmeans=n_samples_kmeans,
+            )
+            return _cuda_peak_mb(device)
+        finally:
+            idx.free()
+            _cleanup(index_name)
+
+    peak_1 = _build_peak(1)
+    peak_2 = _build_peak(2)
+    peak_4 = _build_peak(4)
+    print(f"[mem-profile][build] peak_mb num_shards=1: {peak_1:.1f}")
+    print(f"[mem-profile][build] peak_mb num_shards=2: {peak_2:.1f}")
+    print(f"[mem-profile][build] peak_mb num_shards=4: {peak_4:.1f}")
+
+    # Tolerant comparisons for allocator/runtime noise:
+    # multi-shard should be lower than (or very close to) 1-shard.
+    assert peak_2 <= peak_1 * 1.10, (
+        f"Expected 2-shard create peak <= 1-shard peak (+10% tolerance), "
+        f"got peak_1={peak_1:.1f}MB, peak_2={peak_2:.1f}MB"
+    )
+    assert peak_4 <= peak_1 * 1.10, (
+        f"Expected 4-shard create peak <= 1-shard peak (+10% tolerance), "
+        f"got peak_1={peak_1:.1f}MB, peak_4={peak_4:.1f}MB"
+    )
+
+    # Additional monotonic check between >1 shard cases.
+    assert peak_4 <= peak_2 * 1.10, (
+        f"Expected 4-shard create peak <= 2-shard peak (+10% tolerance), "
+        f"got peak_2={peak_2:.1f}MB, peak_4={peak_4:.1f}MB"
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_GPU_MEMORY_TESTS,
+    reason="Set XTR_WARP_RUN_GPU_MEMORY_TESTS=1 to enable GPU profiling tests",
+)
+def test_profile_build_memory_phase_split():
+    """Profile build-time GPU memory split by phase.
+
+    Separately measures:
+    1) KMeans phase peak
+    2) create/encode+compact phase peak
+    for num_shards in {1, 2, 4}.
+    """
+    usable = _usable_cuda_devices(max_devices=1)
+    if len(usable) < 1:
+        pytest.skip("No usable CUDA devices in this allocation")
+    device = usable[0]
+    device_kind = device.split(":", 1)[0]
+    torch_path = _load_torch_path(device_kind)
+
+    torch.manual_seed(SEED)
+    num_docs = _env_int("XTR_WARP_PROFILE_NUM_DOCS", 600)
+    doc_len = _env_int("XTR_WARP_PROFILE_DOC_LEN", 256)
+    use_triton_kmeans = _env_bool("XTR_WARP_PROFILE_USE_TRITON_KMEANS", False)
+    n_samples_kmeans = _env_opt_int("XTR_WARP_PROFILE_N_SAMPLES_KMEANS")
+    docs = [torch.randn(doc_len, DIM, device="cpu") for _ in range(num_docs)]
+
+    print(
+        "[mem-profile][phase-split] config "
+        f"num_docs={num_docs}, doc_len={doc_len}, dim={DIM}, device={device}, "
+        f"use_triton_kmeans={use_triton_kmeans}, n_samples_kmeans={n_samples_kmeans}"
+    )
+
+    for num_shards in (1, 2, 4):
+        index_name = f".indices/test_shard_mem_phase_{num_shards}"
+        _cleanup(index_name)
+        try:
+            _reset_cuda_peak(device)
+            centroids, dim = compute_kmeans(
+                embeddings_source=docs,
+                device=device,
+                kmeans_niters=4,
+                max_points_per_centroid=256,
+                seed=SEED,
+                n_samples_kmeans=n_samples_kmeans,
+                use_triton_kmeans=use_triton_kmeans,
+            )
+            peak_kmeans = _cuda_peak_mb(device)
+
+            _reset_cuda_peak(device)
+            xtr_warp_rs.create(
+                index=index_name,
+                torch_path=torch_path,
+                device=device,
+                nbits=4,
+                centroids=centroids,
+                embeddings=docs,
+                embedding_dim=dim,
+                seed=SEED,
+                num_shards=num_shards,
+            )
+            peak_create = _cuda_peak_mb(device)
+            print(
+                "[mem-profile][phase-split] "
+                f"num_shards={num_shards} kmeans_peak_mb={peak_kmeans:.1f} "
+                f"create_peak_mb={peak_create:.1f}"
+            )
+            assert peak_kmeans > 0
+            assert peak_create > 0
+        finally:
+            _cleanup(index_name)
+
+
+@pytest.mark.skipif(
+    not RUN_GPU_MEMORY_TESTS,
+    reason="Set XTR_WARP_RUN_GPU_MEMORY_TESTS=1 to enable GPU profiling tests",
+)
+def test_profile_retrieval_memory_distributes_across_devices():
+    """Profile retrieval memory with explicit multi-device sharded load.
+
+    Verifies that explicit 2-device loading reduces per-device peak memory
+    compared to loading the same sharded index on a single device.
+    """
+    index_name = ".indices/test_shard_mem_retrieval"
+    _cleanup(index_name)
+    usable = _usable_cuda_devices(max_devices=2)
+    if len(usable) < 2:
+        pytest.skip(f"Need 2 usable CUDA devices, found {usable}")
+    dev0, dev1 = usable[0], usable[1]
+
+    torch.manual_seed(SEED)
+    num_docs = _env_int("XTR_WARP_PROFILE_NUM_DOCS", 600)
+    doc_len = _env_int("XTR_WARP_PROFILE_DOC_LEN", 256)
+    query_batch = _env_int("XTR_WARP_PROFILE_QUERY_BATCH", 16)
+    query_len = _env_int("XTR_WARP_PROFILE_QUERY_LEN", 32)
+    use_triton_kmeans = _env_bool("XTR_WARP_PROFILE_USE_TRITON_KMEANS", False)
+    n_samples_kmeans = _env_opt_int("XTR_WARP_PROFILE_N_SAMPLES_KMEANS")
+    docs = [torch.randn(doc_len, DIM, device="cpu") for _ in range(num_docs)]
+    queries = torch.randn(query_batch, query_len, DIM, device="cpu")
+    print(
+        "[mem-profile][retrieval] config "
+            f"num_docs={num_docs}, doc_len={doc_len}, q_batch={query_batch}, q_len={query_len}, "
+            f"dim={DIM}, use_triton_kmeans={use_triton_kmeans}, n_samples_kmeans={n_samples_kmeans}"
+    )
+
+    idx = XTRWarp(index=index_name)
+    try:
+        idx.create(
+            embeddings_source=docs,
+            kmeans_niters=4,
+            max_points_per_centroid=256,
+            nbits=4,
+            seed=SEED,
+            device=dev0,
+            num_shards=2,
+            use_triton_kmeans=use_triton_kmeans,
+            n_samples_kmeans=n_samples_kmeans,
+        )
+
+        # Multi-device sharded retrieval profile
+        for dev in (dev0, dev1):
+            _reset_cuda_peak(dev)
+        idx.load(device=[dev0, dev1], dtype=torch.float16, mmap=False)
+        assert idx.devices == [dev0, dev1]
+        _ = idx.search(
+            queries_embeddings=queries,
+            top_k=10,
+            num_threads=1,
+            nprobe=4,
+            bound=128,
+            max_candidates=256,
+        )
+        sharded_peaks = [_cuda_peak_mb(dev0), _cuda_peak_mb(dev1)]
+        print(
+            f"[mem-profile][retrieval] sharded peak_mb per-device "
+            f"{dev0}={sharded_peaks[0]:.1f}, {dev1}={sharded_peaks[1]:.1f}"
+        )
+        idx.free()
+
+        # Single-device retrieval profile (same sharded index loaded on one device only)
+        _reset_cuda_peak(dev0)
+        idx.load(device=dev0, dtype=torch.float16, mmap=False)
+        _ = idx.search(
+            queries_embeddings=queries,
+            top_k=10,
+            num_threads=1,
+            nprobe=4,
+            bound=128,
+            max_candidates=256,
+        )
+        peak_single = _cuda_peak_mb(dev0)
+        print(f"[mem-profile][retrieval] single-device peak_mb {dev0}={peak_single:.1f}")
+        idx.free()
+
+        peak_per_gpu_sharded = max(sharded_peaks)
+        assert peak_per_gpu_sharded <= peak_single * 0.95, (
+            "Expected explicit multi-device sharded retrieval to reduce per-device peak. "
+            f"single={peak_single:.1f}MB, sharded_max={peak_per_gpu_sharded:.1f}MB, "
+            f"sharded_all={sharded_peaks}"
+        )
+    finally:
+        idx.free()
+        _cleanup(index_name)
+
+
+@pytest.mark.skipif(
+    not RUN_GPU_MEMORY_TESTS,
+    reason="Set XTR_WARP_RUN_GPU_MEMORY_TESTS=1 to enable GPU profiling tests",
+)
+def test_profile_high_level_api_create_load_search():
+    """Profile high-level API end-to-end memory on sharded retrieval."""
+    usable = _usable_cuda_devices(max_devices=2)
+    if len(usable) < 2:
+        pytest.skip(f"Need 2 usable CUDA devices, found {usable}")
+    dev0, dev1 = usable[0], usable[1]
+
+    index_name = ".indices/test_profile_highlevel_e2e"
+    _cleanup(index_name)
+
+    torch.manual_seed(SEED)
+    num_docs = _env_int("XTR_WARP_PROFILE_NUM_DOCS", 600)
+    doc_len = _env_int("XTR_WARP_PROFILE_DOC_LEN", 256)
+    query_batch = _env_int("XTR_WARP_PROFILE_QUERY_BATCH", 16)
+    query_len = _env_int("XTR_WARP_PROFILE_QUERY_LEN", 32)
+    use_triton_kmeans = _env_bool("XTR_WARP_PROFILE_USE_TRITON_KMEANS", False)
+    n_samples_kmeans = _env_opt_int("XTR_WARP_PROFILE_N_SAMPLES_KMEANS")
+
+    docs = [torch.randn(doc_len, DIM, device="cpu") for _ in range(num_docs)]
+    queries = torch.randn(query_batch, query_len, DIM, device="cpu")
+    print(
+        "[mem-profile][high-level] config "
+        f"num_docs={num_docs}, doc_len={doc_len}, q_batch={query_batch}, q_len={query_len}, "
+        f"dim={DIM}, use_triton_kmeans={use_triton_kmeans}, "
+        f"n_samples_kmeans={n_samples_kmeans}, devices={[dev0, dev1]}"
+    )
+
+    idx = XTRWarp(index=index_name)
+    try:
+        idx.create(
+            embeddings_source=docs,
+            kmeans_niters=4,
+            max_points_per_centroid=256,
+            nbits=4,
+            seed=SEED,
+            device=dev0,
+            num_shards=2,
+            use_triton_kmeans=use_triton_kmeans,
+            n_samples_kmeans=n_samples_kmeans,
+        )
+
+        _reset_cuda_peak(dev0)
+        _reset_cuda_peak(dev1)
+        idx.load(device=[dev0, dev1], dtype=torch.float16, mmap=False)
+        results = idx.search(
+            queries_embeddings=queries,
+            top_k=10,
+            num_threads=1,
+            nprobe=4,
+            bound=128,
+            max_candidates=256,
+        )
+
+        peak0 = _cuda_peak_mb(dev0)
+        peak1 = _cuda_peak_mb(dev1)
+        print(
+            f"[mem-profile][high-level] retrieval peak_mb "
+            f"{dev0}={peak0:.1f}, {dev1}={peak1:.1f}"
+        )
+        assert len(results) == query_batch
+    finally:
+        idx.free()
+        _cleanup(index_name)

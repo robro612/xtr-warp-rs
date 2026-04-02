@@ -393,6 +393,7 @@ class XTRWarp:
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         num_shards: int | None = None,
+        codec_sample_cap: int | None = None,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -423,6 +424,9 @@ class XTRWarp:
             the index is partitioned by centroid range into ``num_shards``
             subdirectories for multi-GPU search. ``None`` (default) creates
             a single-shard index.
+        codec_sample_cap:
+            Optional cap for Rust-side codec training sample size. This can
+            reduce create-time peak memory for large datasets.
 
         """
         self.device = device
@@ -458,7 +462,7 @@ class XTRWarp:
             use_triton_kmeans=use_triton_kmeans,
         )
 
-        xtr_warp_rs.create(
+        create_kwargs = dict(
             index=self.index,
             torch_path=torch_path,
             device=device,
@@ -469,6 +473,10 @@ class XTRWarp:
             seed=seed,
             num_shards=num_shards,
         )
+        if codec_sample_cap is not None:
+            create_kwargs["codec_sample_cap"] = codec_sample_cap
+
+        xtr_warp_rs.create(**create_kwargs)
 
         return self
 
