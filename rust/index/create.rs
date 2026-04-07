@@ -10,6 +10,13 @@ use std::io::Write;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+fn verbose_enabled() -> bool {
+    matches!(
+        env::var("XTR_WARP_VERBOSE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
 use super::{compact, source::EmbeddingSource};
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::{IndexConfig, IndexMetadata, IndexPlan};
@@ -31,8 +38,18 @@ pub fn create_index(
     // Create the index directory if it doesn't exist
     std::fs::create_dir_all(&config.index_path)?;
 
+    let verbose = verbose_enabled();
+    if verbose {
+        eprintln!("[xtr-warp] Sampling embeddings for codec training...");
+    }
     let (index_plan, sample_pids, sampled_embeddings) =
         plan_and_sample(config, embeddings_source, seed, codec_sample_cap)?;
+    if verbose {
+        eprintln!(
+            "[xtr-warp] Sampled {} embeddings from {} documents ({} chunks).",
+            sampled_embeddings.size()[0], index_plan.n_docs, index_plan.num_chunks
+        );
+    }
 
     let plan_fpath = config.index_path.join("plan.json");
     let plan_data = json!({ "nbits": index_plan.nbits, "num_chunks": index_plan.num_chunks });
@@ -48,6 +65,9 @@ pub fn create_index(
     let pids_fpath = Path::new(&path_str).join("pids.npy");
     Tensor::from_slice(&sample_pids).write_npy(&pids_fpath)?;
 
+    if verbose {
+        eprintln!("[xtr-warp] Training residual codec...");
+    }
     // Train residual codec using sampled embeddings
     let codec = train_residual_codec(
         &sampled_embeddings,
@@ -58,6 +78,9 @@ pub fn create_index(
         &path_str,
     )?;
 
+    if verbose {
+        eprintln!("[xtr-warp] Encoding {} chunks...", index_plan.num_chunks);
+    }
     let encode_result = encode_chunks(
         &index_plan,
         embeddings_source,
@@ -71,7 +94,16 @@ pub fn create_index(
         num_shards,
     )?;
 
+    if verbose {
+        eprintln!(
+            "[xtr-warp] Encoding complete. {} total embeddings. Compacting index...",
+            encode_result.total_embeddings
+        );
+    }
     finalize_and_compact(config, &index_plan, &encode_result, &centroids, num_shards)?;
+    if verbose {
+        eprintln!("[xtr-warp] Index creation complete.");
+    }
 
     Ok(())
 }

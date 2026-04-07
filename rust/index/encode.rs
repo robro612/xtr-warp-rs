@@ -358,9 +358,20 @@ fn encode_chunks_inner(
         );
     }
 
+    let verbose = matches!(
+        env::var("XTR_WARP_VERBOSE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    );
+
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for (local_chk_idx, chunk) in chunk_iter.enumerate() {
         let chk_idx = start_chunk_idx + local_chk_idx;
+        if verbose {
+            eprintln!(
+                "[xtr-warp] Encoding chunk {}/{} (offset={} embeddings so far)...",
+                local_chk_idx + 1, plan.num_chunks, total_embeddings
+            );
+        }
         let chunk = chunk?;
         let chk_doclens = chunk.doclens;
         let chk_embs_vec = chunk.embeddings;

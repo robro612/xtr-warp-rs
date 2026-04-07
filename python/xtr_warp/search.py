@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
+from tqdm.auto import tqdm
 
 from . import xtr_warp_rs
 
@@ -124,7 +125,11 @@ class DiskSource:
         doc_offset = 0
         remaining = len(sampled_pid_set)
 
-        for file, sidecar in self._files_and_doclens:
+        verbose = os.environ.get("XTR_WARP_VERBOSE", "") in ("1", "true", "TRUE", "yes", "YES")
+        file_iter = self._files_and_doclens
+        if verbose:
+            file_iter = tqdm(file_iter, desc="[xtr-warp] Sampling embeddings", unit="file")
+        for file, sidecar in file_iter:
             data = torch.from_numpy(np.load(file))
 
             if tensors is None:
@@ -187,8 +192,11 @@ def compute_kmeans(  # noqa: PLR0913
             1, total_tokens // max_points_per_centroid
         )
     else:
+        _verbose = os.environ.get("XTR_WARP_VERBOSE", "") in ("1", "true", "TRUE", "yes", "YES")
         source = _create_source(embeddings_source)
         num_passages = source.get_num_passages()
+        if _verbose:
+            print(f"[xtr-warp] {num_passages} passages found. Sampling embeddings for k-means...", flush=True)
 
         if n_samples_kmeans is None:
             n_samples_kmeans = min(
@@ -199,7 +207,11 @@ def compute_kmeans(  # noqa: PLR0913
         rng = random.Random(seed)
         sampled_pids = rng.sample(range(num_passages), k=n_samples_kmeans)
 
+        if _verbose:
+            print(f"[xtr-warp] Sampling {n_samples_kmeans}/{num_passages} passages from disk (scanning all embedding files)...", flush=True)
         tensors, total_tokens, dim = source.sample_embeddings(sampled_pids)
+        if _verbose:
+            print(f"[xtr-warp] Loaded {total_tokens} tokens (dim={dim}).", flush=True)
 
         if num_partitions_override is not None:
             num_partitions = num_partitions_override
@@ -230,12 +242,17 @@ def compute_kmeans(  # noqa: PLR0913
     # argmax handles NaN deterministically).  Large datasets stay on GPU.
     use_gpu = (device != "cpu") and total_tokens >= 500_000
 
+    verbose = os.environ.get("XTR_WARP_VERBOSE", "") in ("1", "true", "TRUE", "yes", "YES")
+    k_actual = min(num_partitions, total_tokens)
+    if verbose:
+        print(f"[xtr-warp] K-means: k={k_actual}, tokens={total_tokens}, dim={dim}, gpu={use_gpu}", flush=True)
+
     kmeans = FastKMeans(
         d=dim,
-        k=min(num_partitions, total_tokens),
+        k=k_actual,
         niter=kmeans_niters,
         gpu=use_gpu,
-        verbose=False,
+        verbose=verbose,
         seed=seed,
         max_points_per_centroid=max_points_per_centroid,
         use_triton=use_triton_kmeans if use_gpu else False,
@@ -264,6 +281,9 @@ def compute_kmeans(  # noqa: PLR0913
             centroids.shape[0],
         )
         centroids = centroids[valid]
+
+    if verbose:
+        print(f"[xtr-warp] K-means complete. {centroids.shape[0]} centroids.", flush=True)
 
     return torch.nn.functional.normalize(
         input=centroids,
