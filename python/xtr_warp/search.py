@@ -1037,8 +1037,6 @@ class XTRWarp:
             return self
 
         devices = [device] if isinstance(device, str) else device
-        dtype_str = str(dtype).split(".")[1]
-        self.dtype = dtype
 
         _ = self._load_metadata()
         self.devices = devices
@@ -1057,6 +1055,21 @@ class XTRWarp:
 
         # Store the primary device so mutation methods can default to it
         self.device = self.devices[0]
+
+        # Guard against known CPU fp16/bf16 instability in tch-rs/libtorch-backed search paths.
+        if all(d == "cpu" for d in self.devices) and dtype in {
+            torch.float16,
+            torch.bfloat16,
+        }:
+            logger.warning(
+                "dtype=%s on CPU is unreliable with tch-rs/libtorch half precision; "
+                "using float32 instead.",
+                dtype,
+            )
+            dtype = torch.float32
+
+        dtype_str = str(dtype).split(".")[1]
+        self.dtype = dtype
 
         if mmap and any(d != "cpu" for d in self.devices):
             logger.warning(

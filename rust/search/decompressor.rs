@@ -107,6 +107,10 @@ impl CentroidDecompressor {
         let ends = index.offsets_compacted.index_select(0, &(&lookup_ids + 1));
         let capacities = &ends - &begins;
 
+        // CPU float16 math in tch-rs/libtorch is fragile and often slower.
+        // Keep all CPU-side scoring in float32, independent of requested dtype.
+        let cpu_score_kind = Kind::Float;
+
         // Early exit when there is nothing to process
         if num_cells == 0 {
             let empty = Tensor::zeros(&[0], (Kind::Int, self.device));
@@ -114,14 +118,18 @@ impl CentroidDecompressor {
                 capacities,
                 sizes: empty.to_kind(Kind::Int),
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
-                scores: Tensor::zeros(&[0], (self.dtype, self.device)),
+                scores: Tensor::zeros(&[0], (cpu_score_kind, self.device)),
                 offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
             });
         }
 
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
 
-        let query_embeddings = query_embeddings.to_kind(self.dtype);
+        let query_embeddings = if self.device.is_cuda() {
+            query_embeddings.to_kind(self.dtype)
+        } else {
+            query_embeddings.to_kind(cpu_score_kind)
+        };
         anyhow::ensure!(
             query_embeddings.size()[1] == self.dim as i64,
             "Query embedding dim ({}) does not match index dim ({})",
@@ -147,12 +155,15 @@ impl CentroidDecompressor {
             );
         }
 
-        let bucket_weights = index.bucket_weights.to_kind(self.dtype);
+        let bucket_weights = index.bucket_weights.to_kind(cpu_score_kind);
         let vt_bucket_scores =
             (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
 
         let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
-        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
+        let centroid_scores_vec: Vec<f32> = centroid_scores
+            .to_kind(cpu_score_kind)
+            .flatten(0, -1)
+            .try_into()?;
 
         anyhow::ensure!(
             centroid_scores_vec.len() == num_cells,
@@ -258,7 +269,7 @@ impl CentroidDecompressor {
             .to_kind(Kind::Int64);
         let scores_tensor = Tensor::from_slice(&candidate_scores)
             .to_device(self.device)
-            .to_kind(self.dtype);
+            .to_kind(cpu_score_kind);
         let offsets_tensor = Tensor::from_slice(&offsets)
             .to_device(self.device)
             .to_kind(Kind::Int64);
