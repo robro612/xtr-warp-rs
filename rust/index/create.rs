@@ -282,7 +282,7 @@ fn finalize_and_compact(
     };
 
     let num_centroids = centroids.size()[0] as usize;
-    let effective_shards = num_shards.filter(|&n| n > 1);
+    let effective_shards = num_shards.filter(|&n| n >= 1);
 
     let (shard_count, shard_boundaries) = if let Some(n) = effective_shards {
         let (_, boundaries) = compact::compact_index_sharded(
