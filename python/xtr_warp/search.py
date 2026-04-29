@@ -365,7 +365,7 @@ def compute_kmeans(  # noqa: PLR0913
     # CUDA assertion inside the k-means iteration itself.  For small token
     # counts (< 500k) CPU k-means is sub-second and immune to this (CPU
     # argmax handles NaN deterministically).  Large datasets stay on GPU.
-    use_gpu = (device != "cpu") and total_tokens >= 500_000
+    use_gpu = (device != "cpu") and total_tokens >= 5_000_000
 
     verbose = os.environ.get("XTR_WARP_VERBOSE", "") in ("1", "true", "TRUE", "yes", "YES")
     k_actual = min(num_partitions, total_tokens)

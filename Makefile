@@ -12,7 +12,7 @@ TORCH_ENV = \
 	LIBTORCH_BYPASS_VERSION_CHECK=1 \
 	LIBTORCH=$$($(PYTHON) -c "import torch,os;print(os.path.dirname(torch.__file__))")
 
-.PHONY: help install-gpu install clean build test
+.PHONY: help install-gpu install clean build test test-shards
 
 help:	## Show all Makefile targets.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[33m%-30s\033[0m %s\n", $$1, $$2}'
@@ -45,3 +45,15 @@ build:	## Build the project
 test:	## Run tests
 	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
 	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py
+
+test-shards:	## Run sharded index tests (requires multi-GPU, use with srun)
+	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
+	$(TORCH_ENV) \
+		XTR_WARP_CODEC_SAMPLE_CAP=1024 \
+		XTR_WARP_PROFILE_COMPACTION=1 \
+		XTR_WARP_PROFILE_ENCODE=1 \
+		XTR_WARP_PROFILE_ENCODE_LOCAL=1 \
+		XTR_WARP_RUN_GPU_MEMORY_TESTS=1 \
+		XTR_WARP_PROFILE_NUM_DOCS=50000 \
+		XTR_WARP_PROFILE_DOC_LEN=1024 \
+		$(PYTEST) tests/test_sharding.py tests/test_index_management_sharded.py -v -s -o "addopts="
