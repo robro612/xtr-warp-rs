@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: ""
+      python_versions:
+        description: 'JSON array of Python versions to build (e.g. ''["3.10","3.11","3.12","3.13","3.14"]''). Use to exclude versions not supported by the chosen torch (torch 2.7/2.8 lack cp314 wheels).'
+        required: false
+        type: string
+        default: '["3.10","3.11","3.12","3.13","3.14"]'
   workflow_call:
     inputs:
       base_version:
@@ -43,6 +48,10 @@ on:
         required: false
         type: string
         default: ""
+      python_versions:
+        required: false
+        type: string
+        default: '["3.10","3.11","3.12","3.13","3.14"]'
     secrets:
       PYPI_API_TOKEN:
         required: true
@@ -59,7 +68,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ${{ fromJSON(inputs.python_versions) }}
 
     steps:
       - uses: actions/checkout@v4

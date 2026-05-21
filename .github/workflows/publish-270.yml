@@ -16,4 +16,5 @@ jobs:
       torch_suffix: "270"
       torch_version: "2.7.0"
       torch_req: "torch>=2.7,<2.8"
+      python_versions: '["3.10","3.11","3.12","3.13"]'
     secrets: inherit
